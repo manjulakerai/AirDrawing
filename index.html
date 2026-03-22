@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Air Drawing</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #1a1a2e;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: 'Segoe UI', sans-serif;
+      color: #fff;
+      gap: 16px;
+    }
+
+    h1 {
+      font-size: 1.4rem;
+      letter-spacing: 2px;
+      color: #a0c4ff;
+      text-transform: uppercase;
+    }
+
+    #controls {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      background: #16213e;
+      padding: 12px 24px;
+      border-radius: 40px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+    }
+
+    #controls label {
+      font-size: 0.8rem;
+      color: #a0c4ff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+    }
+
+    #colorPicker {
+      width: 40px;
+      height: 40px;
+      border: none;
+      border-radius: 50%;
+      cursor: pointer;
+      padding: 2px;
+      background: none;
+    }
+
+    #brushSize {
+      width: 100px;
+      accent-color: #a0c4ff;
+    }
+
+    #clearBtn {
+      background: #e63946;
+      color: white;
+      border: none;
+      padding: 8px 20px;
+      border-radius: 20px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      font-weight: 600;
+      transition: background 0.2s;
+    }
+    #clearBtn:hover { background: #c1121f; }
+
+    #status {
+      font-size: 0.8rem;
+      color: #ffd166;
+      min-height: 1.2em;
+    }
+
+    #container {
+      position: relative;
+      width: 640px;
+      height: 480px;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+      transform: scaleX(-1); /* mirror entire stack */
+    }
+
+    #video {
+      position: absolute;
+      top: 0; left: 0;
+      width: 640px;
+      height: 480px;
+      object-fit: cover;
+    }
+
+    #drawCanvas {
+      position: absolute;
+      top: 0; left: 0;
+      width: 640px;
+      height: 480px;
+      pointer-events: none;
+    }
+
+    #cursorCanvas {
+      position: absolute;
+      top: 0; left: 0;
+      width: 640px;
+      height: 480px;
+      pointer-events: none;
+    }
+
+    #gestureIndicator {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: #555;
+      transition: background 0.1s;
+    }
+    #gestureIndicator.drawing { background: #06d6a0; box-shadow: 0 0 8px #06d6a0; }
+
+    #hint {
+      font-size: 0.75rem;
+      color: #888;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>✏ Air Drawing</h1>
+
+  <div id="controls">
+    <label>
+      Color
+      <input type="color" id="colorPicker" value="#ff6b6b" />
+    </label>
+    <label>
+      Size
+      <input type="range" id="brushSize" min="2" max="30" value="6" />
+    </label>
+    <button id="clearBtn">Clear</button>
+  </div>
+
+  <div id="status">Loading MediaPipe...</div>
+
+  <div id="container">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="drawCanvas"></canvas>
+    <canvas id="cursorCanvas"></canvas>
+    <div id="gestureIndicator"></div>
+  </div>
+
+  <div id="hint">Index finger up + middle finger down = draw &nbsp;|&nbsp; All fingers up = lift pen</div>
+
+  <!-- MediaPipe CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+  <script>
+    const video         = document.getElementById('video');
+    const drawCanvas    = document.getElementById('drawCanvas');
+    const cursorCanvas  = document.getElementById('cursorCanvas');
+    const colorPicker   = document.getElementById('colorPicker');
+    const brushSlider   = document.getElementById('brushSize');
+    const clearBtn      = document.getElementById('clearBtn');
+    const statusEl      = document.getElementById('status');
+    const indicator     = document.getElementById('gestureIndicator');
+
+    const W = 640, H = 480;
+    drawCanvas.width   = W; drawCanvas.height   = H;
+    cursorCanvas.width = W; cursorCanvas.height = H;
+
+    const dCtx = drawCanvas.getContext('2d');
+    const cCtx = cursorCanvas.getContext('2d');
+
+    // Drawing state
+    let penDown   = false;
+    let prevPoint = null;
+    let currentColor = colorPicker.value;
+    let currentSize  = parseInt(brushSlider.value);
+
+    // Smoothing (exponential moving average)
+    const ALPHA = 0.55;
+    let smoothX = null;
+    let smoothY = null;
+
+    // --- Gesture helpers ---
+    function isIndexUp(lm) {
+      // tip y < MCP y means finger is raised (y grows downward)
+      return lm[8].y < lm[5].y - 0.02;
+    }
+
+    function isMiddleDown(lm) {
+      // tip y > PIP y means middle finger is curled
+      return lm[12].y > lm[10].y;
+    }
+
+    function isRingDown(lm) {
+      return lm[16].y > lm[14].y;
+    }
+
+    function isPinkyDown(lm) {
+      return lm[20].y > lm[18].y;
+    }
+
+    // Draw mode: index up, middle + ring + pinky curled
+    function shouldDraw(lm) {
+      return isIndexUp(lm) && isMiddleDown(lm) && isRingDown(lm) && isPinkyDown(lm);
+    }
+
+    // --- MediaPipe onResults ---
+    function onResults(results) {
+      // Clear cursor canvas each frame
+      cCtx.clearRect(0, 0, W, H);
+
+      if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+        penDown   = false;
+        prevPoint = null;
+        smoothX   = null;
+        smoothY   = null;
+        indicator.classList.remove('drawing');
+        return;
+      }
+
+      const lm = results.multiHandLandmarks[0];
+
+      // Raw fingertip position in canvas pixels
+      const rawX = lm[8].x * W;
+      const rawY = lm[8].y * H;
+
+      // Smooth position
+      smoothX = smoothX === null ? rawX : ALPHA * rawX + (1 - ALPHA) * smoothX;
+      smoothY = smoothY === null ? rawY : ALPHA * rawY + (1 - ALPHA) * smoothY;
+
+      const drawing = shouldDraw(lm);
+      indicator.classList.toggle('drawing', drawing);
+
+      if (drawing) {
+        if (!penDown || prevPoint === null) {
+          // Pen just touched down — begin new sub-path
+          dCtx.beginPath();
+          dCtx.moveTo(smoothX, smoothY);
+          penDown = true;
+        } else {
+          // Continue stroke
+          dCtx.lineTo(smoothX, smoothY);
+          dCtx.strokeStyle = currentColor;
+          dCtx.lineWidth   = currentSize;
+          dCtx.lineCap     = 'round';
+          dCtx.lineJoin    = 'round';
+          dCtx.stroke();
+          // Keep path open for next lineTo
+          dCtx.beginPath();
+          dCtx.moveTo(smoothX, smoothY);
+        }
+        prevPoint = { x: smoothX, y: smoothY };
+      } else {
+        penDown   = false;
+        prevPoint = null;
+      }
+
+      // Draw finger cursor dot
+      const dotColor = drawing ? currentColor : 'rgba(255,255,255,0.7)';
+      const dotRadius = drawing ? currentSize / 2 + 4 : 8;
+      cCtx.beginPath();
+      cCtx.arc(smoothX, smoothY, dotRadius, 0, Math.PI * 2);
+      cCtx.fillStyle = dotColor;
+      cCtx.fill();
+      cCtx.strokeStyle = 'rgba(0,0,0,0.4)';
+      cCtx.lineWidth = 1.5;
+      cCtx.stroke();
+    }
+
+    // --- Init MediaPipe Hands ---
+    const hands = new Hands({
+      locateFile: (file) =>
+        `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.7,
+      minTrackingConfidence: 0.5
+    });
+
+    hands.onResults(onResults);
+
+    // --- Start Camera ---
+    const camera = new Camera(video, {
+      onFrame: async () => {
+        await hands.send({ image: video });
+      },
+      width: W,
+      height: H,
+      facingMode: 'user'
+    });
+
+    camera.start().then(() => {
+      statusEl.textContent = 'Ready — raise your index finger to draw!';
+      statusEl.style.color = '#06d6a0';
+    }).catch((err) => {
+      statusEl.textContent = 'Camera error: ' + err.message;
+      statusEl.style.color = '#e63946';
+    });
+
+    // --- Controls ---
+    colorPicker.addEventListener('input', () => {
+      currentColor = colorPicker.value;
+    });
+
+    brushSlider.addEventListener('input', () => {
+      currentSize = parseInt(brushSlider.value);
+    });
+
+    clearBtn.addEventListener('click', () => {
+      dCtx.clearRect(0, 0, W, H);
+      penDown   = false;
+      prevPoint = null;
+    });
+  </script>
+
+</body>
+</html>
